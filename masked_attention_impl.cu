@@ -61,19 +61,18 @@ void launch_masked_attention(
     CUDA_CHECK(cudaGetLastError());
 }
 
-// Specialized kernel for common data types
+// Specialized kernel for FP16 with proper half precision operations
 template<>
 __global__ void masked_attention_kernel<half>(
     const half* query, const half* key, const half* value, const bool* mask,
     half* output, half* attention_weights,
     int batch_size, int num_heads, int seq_len, int head_dim, float scale
 ) {
-    // FP16 optimized version using tensor cores when available
-    auto block = cooperative_groups::this_thread_block();
-    auto warp = cooperative_groups::tiled_partition<32>(block);
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     
-    extern __shared__ half shmem_half[];
-    half* s_query = shmem_half;
+    extern __shared__ char shared_mem_half[];
+    half* s_query = reinterpret_cast<half*>(shared_mem_half);
     half* s_key = s_query + TILE_SIZE * head_dim;
     half* s_value = s_key + TILE_SIZE * head_dim;
     half* s_scores = s_value + TILE_SIZE * head_dim;
@@ -86,7 +85,7 @@ __global__ void masked_attention_kernel<half>(
         return;
     }
     
-    // Use half precision arithmetic with automatic mixed precision
+    // Use half precision arithmetic with proper CUDA half operations
     half scale_half = __float2half(scale);
     half max_score = __float2half(-65504.0f); // -inf for half
     half attention_sum = __float2half(0.0f);
@@ -153,10 +152,19 @@ __global__ void masked_attention_kernel<half>(
                 half val = value[batch_idx * num_heads * seq_len * head_dim + 
                                head_idx * seq_len * head_dim + actual_key_idx * head_dim + threadIdx.x];
                 
-                // Atomic add for half precision
+                // Use atomic add for half precision
+                #if __CUDA_ARCH__ >= 700
                 atomicAdd(&output[batch_idx * num_heads * seq_len * head_dim + 
                                 head_idx * seq_len * head_dim + query_idx * head_dim + threadIdx.x],
                          __hmul(exp_score, val));
+                #else
+                // Fallback for older architectures
+                output[batch_idx * num_heads * seq_len * head_dim + 
+                      head_idx * seq_len * head_dim + query_idx * head_dim + threadIdx.x] = 
+                      __hadd(output[batch_idx * num_heads * seq_len * head_dim + 
+                                   head_idx * seq_len * head_dim + query_idx * head_dim + threadIdx.x],
+                            __hmul(exp_score, val));
+                #endif
             }
         }
         block.sync();

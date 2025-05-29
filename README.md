@@ -8,8 +8,6 @@ This is a CUDA kernel-based masked multi-head self-attention implementation code
 git clone https://github.com/DongHyun99/masked-attention-cuda.git
 cd masked-attention-cuda
 
-python setup.py build_ext --inplace
-
-pip install -e .
-
+chmod +x install.sh
+./install.sh
 ```

@@ -142,30 +142,104 @@ build_and_install() {
 test_installation() {
     print_status "Testing installation..."
     
-    # Test import
+    # Test CUDA extension import (optional)
     if python3 -c "import masked_attention_cuda; print('CUDA extension imported successfully')" &> /dev/null; then
         print_success "CUDA extension import test passed"
+        CUDA_EXT_AVAILABLE=true
     else
-        print_error "CUDA extension import failed"
+        print_warning "CUDA extension import failed (fallback to PyTorch implementation)"
+        CUDA_EXT_AVAILABLE=false
+    fi
+    
+    # Test performance optimized module
+    if python3 -c "from masked_vit_attention import MaskedAttention; print('Performance optimized module imported successfully')" &> /dev/null; then
+        print_success "Performance optimized module import test passed"
+    else
+        print_error "Performance optimized module import failed"
         return 1
     fi
     
-    # Test Python module
-    if python3 -c "from masked_vit_attention import MaskedViTAttention; print('Python module imported successfully')" &> /dev/null; then
-        print_success "Python module import test passed"
+    # Test legacy module compatibility (if exists)
+    if python3 -c "from masked_vit_attention import MaskedViTAttention; print('Legacy module imported successfully')" &> /dev/null; then
+        print_success "Legacy module import test passed"
     else
-        print_error "Python module import failed"
-        return 1
+        print_warning "Legacy module not available (using performance optimized version only)"
     fi
     
-    # Run basic functionality test
+    # Test basic functionality
     if [ -f "test_masked_attention.py" ]; then
         print_status "Running basic functionality test..."
-        if python3 -c "from test_masked_attention import test_basic_functionality; test_basic_functionality()" &> /dev/null; then
-            print_success "Basic functionality test passed"
+        
+        # Try to run a simple test first
+        TEST_RESULT=$(python3 -c "
+import torch
+from masked_vit_attention import MaskedAttention
+
+class TestConfig:
+    hidden_size = 768
+    num_attention_heads = 12
+    attention_probs_dropout_prob = 0.1
+    hidden_dropout_prob = 0.1
+
+try:
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    config = TestConfig()
+    model = MaskedAttention(config).to(device)
+    
+    # Simple forward pass test
+    batch_size, seq_len = 1, 10
+    hidden_states = torch.randn(batch_size, seq_len, config.hidden_size, device=device)
+    mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=device)
+    
+    with torch.no_grad():
+        output, _ = model(hidden_states, mask)
+    
+    assert output.shape == hidden_states.shape
+    print('SUCCESS: Basic forward pass test completed')
+except Exception as e:
+    print(f'ERROR: {str(e)}')
+" 2>&1)
+        
+        if echo "$TEST_RESULT" | grep -q "SUCCESS"; then
+            print_success "Basic forward pass test passed"
+            
+            # Run full test suite if simple test passes
+            if python3 -c "from test_masked_attention import test_basic_functionality; test_basic_functionality()" &> /dev/null; then
+                print_success "Full basic functionality test passed"
+            else
+                print_warning "Full test suite had issues, but basic functionality works"
+            fi
         else
-            print_warning "Basic functionality test failed (this might be OK for some environments)"
+            print_warning "Basic functionality test failed:"
+            echo "$TEST_RESULT" | grep "ERROR" | sed 's/^/    /'
+            print_warning "This might be OK for some environments - manual testing recommended"
         fi
+    else
+        print_warning "test_masked_attention.py not found - skipping functionality tests"
+    fi
+    
+    # Test PyTorch and CUDA availability
+    print_status "Checking PyTorch CUDA support..."
+    TORCH_CUDA_TEST=$(python3 -c "
+import torch
+print(f'PyTorch version: {torch.__version__}')
+print(f'CUDA available: {torch.cuda.is_available()}')
+if torch.cuda.is_available():
+    print(f'CUDA version: {torch.version.cuda}')
+    print(f'GPU count: {torch.cuda.device_count()}')
+    for i in range(torch.cuda.device_count()):
+        print(f'GPU {i}: {torch.cuda.get_device_name(i)}')
+else:
+    print('Running on CPU - GPU acceleration not available')
+" 2>&1)
+    
+    echo "$TORCH_CUDA_TEST" | sed 's/^/    /'
+    
+    # Final status
+    if [ "$CUDA_EXT_AVAILABLE" = true ]; then
+        print_success "Installation verification completed - CUDA acceleration available"
+    else
+        print_success "Installation verification completed - CPU/PyTorch fallback available"
     fi
     
     return 0
@@ -197,8 +271,19 @@ main() {
         print_success "Installation completed successfully!"
         print_success "=============================================="
         echo
-        echo "You can now use the masked attention module:"
-        echo "  from masked_vit_attention import MaskedViTAttention"
+        echo "You can now use the performance-optimized masked attention module:"
+        echo "  from masked_vit_attention import MaskedAttention"
+        echo
+        if [ "$CUDA_EXT_AVAILABLE" = true ]; then
+            echo "CUDA acceleration is available! For best performance:"
+            echo "  # For large tensors (recommended)"
+            echo "  model = MaskedAttention(config, use_cuda_kernel=False)"
+            echo "  # For small tensors"
+            echo "  model = MaskedAttention(config, use_cuda_kernel=True)"
+        else
+            echo "CUDA extension not available, using optimized PyTorch backend:"
+            echo "  model = MaskedAttention(config, use_cuda_kernel=False)"
+        fi
         echo
         echo "Run examples:"
         echo "  python3 example_usage.py"
@@ -206,14 +291,28 @@ main() {
         echo "Run tests:"
         echo "  python3 test_masked_attention.py"
         echo
+        echo "Run comprehensive performance benchmark:"
+        echo "  python3 -c \"from performance_optimized_attention import benchmark_attention_backends; benchmark_attention_backends()\""
+        echo
     else
         echo
         print_error "=============================================="
         print_error "Installation completed with warnings!"
         print_error "=============================================="
         echo
-        print_warning "Some tests failed, but the extension might still work."
-        print_warning "Try running the examples to verify functionality."
+        print_warning "Some components failed, but the module might still work."
+        echo
+        echo "Try testing manually:"
+        echo "  python3 -c \"from masked_vit_attention import MaskedAttention; print('Import successful')\""
+        echo
+        echo "If the above works, you can run:"
+        echo "  python3 example_usage.py"
+        echo "  python3 test_masked_attention.py"
+        echo
+        echo "For troubleshooting:"
+        echo "  - Check CUDA installation: nvidia-smi"
+        echo "  - Check PyTorch CUDA: python3 -c \"import torch; print(torch.cuda.is_available())\""
+        echo "  - Try CPU-only mode: use_cuda_kernel=False"
         echo
     fi
 }

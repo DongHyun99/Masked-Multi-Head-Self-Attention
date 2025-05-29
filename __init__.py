@@ -1,7 +1,5 @@
-from masked_vit_attention import MaskedViTAttention, MaskedViTSelfAttention, replace_vit_attention_with_masked
-
+from masked_vit_attention import MaskedAttention, benchmark_attention_backends
 __all__ = [
-    "MaskedViTAttention",
-    "MaskedViTSelfAttention",
-    "replace_vit_attention_with_masked",
+    "MaskedAttention",
+    "benchmark_attention_backends",
 ]

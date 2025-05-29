@@ -1,317 +1,345 @@
 #include <torch/extension.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cublas_v2.h>
-#include <cudnn.h>
-#include <cmath>
+#include <cublasLt.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 
-// CUDA kernel for masked QKV projection
+// CUDA kernels for masked multi-head self-attention
+template<typename T>
 __global__ void masked_qkv_projection_kernel(
-    const float* input,           // [batch_size, seq_len, hidden_dim]
-    const float* weight_q,        // [hidden_dim, hidden_dim]
-    const float* weight_k,        // [hidden_dim, hidden_dim]
-    const float* weight_v,        // [hidden_dim, hidden_dim]
-    const float* bias_q,          // [hidden_dim]
-    const float* bias_k,          // [hidden_dim]
-    const float* bias_v,          // [hidden_dim]
-    const bool* mask,             // [batch_size, seq_len]
-    float* query,                 // [batch_size, seq_len, hidden_dim]
-    float* key,                   // [batch_size, seq_len, hidden_dim]
-    float* value,                 // [batch_size, seq_len, hidden_dim]
+    const T* input,           // [B, N, D]
+    const T* weight_q,        // [D, D]
+    const T* weight_k,        // [D, D]
+    const T* weight_v,        // [D, D]
+    const T* bias_q,          // [D]
+    const T* bias_k,          // [D]
+    const T* bias_v,          // [D]
+    const bool* mask,         // [B, N]
+    T* query,                 // [B, N, D]
+    T* key,                   // [B, N, D]
+    T* value,                 // [B, N, D]
     int batch_size,
     int seq_len,
-    int hidden_dim
+    int dim
 ) {
-    int batch_idx = blockIdx.x;
-    int seq_idx = blockIdx.y;
-    int dim_idx = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * seq_len * dim;
     
-    if (batch_idx >= batch_size || seq_idx >= seq_len || dim_idx >= hidden_dim) {
+    if (idx >= total_elements) return;
+    
+    int b = idx / (seq_len * dim);
+    int n = (idx % (seq_len * dim)) / dim;
+    int d = idx % dim;
+    
+    // Check if this token is masked
+    if (!mask[b * seq_len + n]) {
+        query[idx] = T(0);
+        key[idx] = T(0);
+        value[idx] = T(0);
         return;
     }
     
-    // Check if current token is masked
-    bool is_masked = mask[batch_idx * seq_len + seq_idx];
+    // Compute Q, K, V projections
+    T q_val = bias_q[d];
+    T k_val = bias_k[d];
+    T v_val = bias_v[d];
     
-    if (!is_masked) {
-        // Zero out masked positions
-        query[batch_idx * seq_len * hidden_dim + seq_idx * hidden_dim + dim_idx] = 0.0f;
-        key[batch_idx * seq_len * hidden_dim + seq_idx * hidden_dim + dim_idx] = 0.0f;
-        value[batch_idx * seq_len * hidden_dim + seq_idx * hidden_dim + dim_idx] = 0.0f;
-        return;
+    for (int i = 0; i < dim; i++) {
+        T inp_val = input[b * seq_len * dim + n * dim + i];
+        q_val += inp_val * weight_q[i * dim + d];
+        k_val += inp_val * weight_k[i * dim + d];
+        v_val += inp_val * weight_v[i * dim + d];
     }
     
-    // Compute QKV projections for non-masked tokens
-    float input_val = input[batch_idx * seq_len * hidden_dim + seq_idx * hidden_dim + dim_idx];
-    
-    float q_sum = 0.0f, k_sum = 0.0f, v_sum = 0.0f;
-    
-    // Matrix multiplication with weight matrices
-    for (int i = 0; i < hidden_dim; i++) {
-        float inp = input[batch_idx * seq_len * hidden_dim + seq_idx * hidden_dim + i];
-        q_sum += inp * weight_q[i * hidden_dim + dim_idx];
-        k_sum += inp * weight_k[i * hidden_dim + dim_idx];
-        v_sum += inp * weight_v[i * hidden_dim + dim_idx];
-    }
-    
-    // Add bias
-    query[batch_idx * seq_len * hidden_dim + seq_idx * hidden_dim + dim_idx] = q_sum + bias_q[dim_idx];
-    key[batch_idx * seq_len * hidden_dim + seq_idx * hidden_dim + dim_idx] = k_sum + bias_k[dim_idx];
-    value[batch_idx * seq_len * hidden_dim + seq_idx * hidden_dim + dim_idx] = v_sum + bias_v[dim_idx];
+    query[idx] = q_val;
+    key[idx] = k_val;
+    value[idx] = v_val;
 }
 
-// Optimized CUDA kernel for masked attention computation
-__global__ void masked_attention_kernel(
-    const float* query,           // [batch_size, num_heads, seq_len, head_dim]
-    const float* key,             // [batch_size, num_heads, seq_len, head_dim]
-    const float* value,           // [batch_size, num_heads, seq_len, head_dim]
-    const bool* mask,             // [batch_size, seq_len]
-    float* attention_output,      // [batch_size, num_heads, seq_len, head_dim]
-    float* attention_weights,     // [batch_size, num_heads, seq_len, seq_len]
+template<typename T>
+__global__ void masked_attention_scores_kernel(
+    const T* query,           // [B, H, N, D/H]
+    const T* key,             // [B, H, N, D/H]
+    const bool* mask,         // [B, N]
+    T* scores,                // [B, H, N, N]
     int batch_size,
     int num_heads,
     int seq_len,
     int head_dim,
     float scale
 ) {
-    int batch_idx = blockIdx.x;
-    int head_idx = blockIdx.y;
-    int query_idx = blockIdx.z;
-    int key_idx = threadIdx.x;
+    int b = blockIdx.x;
+    int h = blockIdx.y;
+    int i = blockIdx.z * blockDim.x + threadIdx.x;
+    int j = blockIdx.z * blockDim.y + threadIdx.y;
     
-    if (batch_idx >= batch_size || head_idx >= num_heads || 
-        query_idx >= seq_len || key_idx >= seq_len) {
+    if (b >= batch_size || h >= num_heads || i >= seq_len || j >= seq_len) return;
+    
+    // Check if either token is masked
+    if (!mask[b * seq_len + i] || !mask[b * seq_len + j]) {
+        scores[b * num_heads * seq_len * seq_len + h * seq_len * seq_len + i * seq_len + j] = T(-1e9);
         return;
     }
     
-    // Check if query token is masked
-    bool query_masked = !mask[batch_idx * seq_len + query_idx];
-    bool key_masked = !mask[batch_idx * seq_len + key_idx];
-    
-    int q_offset = batch_idx * num_heads * seq_len * head_dim + 
-                   head_idx * seq_len * head_dim + 
-                   query_idx * head_dim;
-    int k_offset = batch_idx * num_heads * seq_len * head_dim + 
-                   head_idx * seq_len * head_dim + 
-                   key_idx * head_dim;
-    
     // Compute attention score
-    float score = 0.0f;
-    if (!query_masked && !key_masked) {
-        for (int d = 0; d < head_dim; d++) {
-            score += query[q_offset + d] * key[k_offset + d];
-        }
-        score *= scale;
-    } else {
-        score = -INFINITY; // Mask out invalid positions
+    T score = T(0);
+    for (int d = 0; d < head_dim; d++) {
+        T q_val = query[b * num_heads * seq_len * head_dim + h * seq_len * head_dim + i * head_dim + d];
+        T k_val = key[b * num_heads * seq_len * head_dim + h * seq_len * head_dim + j * head_dim + d];
+        score += q_val * k_val;
     }
     
-    // Store attention weight
-    int weight_idx = batch_idx * num_heads * seq_len * seq_len + 
-                     head_idx * seq_len * seq_len + 
-                     query_idx * seq_len + key_idx;
-    attention_weights[weight_idx] = score;
+    scores[b * num_heads * seq_len * seq_len + h * seq_len * seq_len + i * seq_len + j] = score * T(scale);
+}
+
+template<typename T>
+__global__ void masked_softmax_kernel(
+    T* scores,                // [B, H, N, N]
+    const bool* mask,         // [B, N]
+    int batch_size,
+    int num_heads,
+    int seq_len
+) {
+    int b = blockIdx.x;
+    int h = blockIdx.y;
+    int i = blockIdx.z * blockDim.x + threadIdx.x;
     
-    __syncthreads();
+    if (b >= batch_size || h >= num_heads || i >= seq_len) return;
     
-    // Softmax computation (only for thread 0 of each query)
-    if (key_idx == 0 && !query_masked) {
-        // Find maximum for numerical stability
-        float max_score = -INFINITY;
-        for (int k = 0; k < seq_len; k++) {
-            int idx = batch_idx * num_heads * seq_len * seq_len + 
-                     head_idx * seq_len * seq_len + 
-                     query_idx * seq_len + k;
-            if (attention_weights[idx] > max_score) {
-                max_score = attention_weights[idx];
-            }
+    // Skip masked tokens
+    if (!mask[b * seq_len + i]) {
+        for (int j = 0; j < seq_len; j++) {
+            scores[b * num_heads * seq_len * seq_len + h * seq_len * seq_len + i * seq_len + j] = T(0);
         }
-        
-        // Compute exponentials and sum
-        float sum_exp = 0.0f;
-        for (int k = 0; k < seq_len; k++) {
-            int idx = batch_idx * num_heads * seq_len * seq_len + 
-                     head_idx * seq_len * seq_len + 
-                     query_idx * seq_len + k;
-            if (attention_weights[idx] != -INFINITY) {
-                attention_weights[idx] = expf(attention_weights[idx] - max_score);
-                sum_exp += attention_weights[idx];
-            } else {
-                attention_weights[idx] = 0.0f;
-            }
-        }
-        
-        // Normalize
-        if (sum_exp > 0.0f) {
-            for (int k = 0; k < seq_len; k++) {
-                int idx = batch_idx * num_heads * seq_len * seq_len + 
-                         head_idx * seq_len * seq_len + 
-                         query_idx * seq_len + k;
-                attention_weights[idx] /= sum_exp;
-            }
+        return;
+    }
+    
+    // Find max for numerical stability
+    T max_val = T(-1e9);
+    for (int j = 0; j < seq_len; j++) {
+        if (mask[b * seq_len + j]) {
+            T val = scores[b * num_heads * seq_len * seq_len + h * seq_len * seq_len + i * seq_len + j];
+            max_val = fmaxf(max_val, val);
         }
     }
     
-    __syncthreads();
-    
-    // Compute attention output
-    if (key_idx < head_dim) {
-        float output_val = 0.0f;
-        
-        if (!query_masked) {
-            for (int k = 0; k < seq_len; k++) {
-                int weight_idx = batch_idx * num_heads * seq_len * seq_len + 
-                               head_idx * seq_len * seq_len + 
-                               query_idx * seq_len + k;
-                int v_offset = batch_idx * num_heads * seq_len * head_dim + 
-                              head_idx * seq_len * head_dim + 
-                              k * head_dim + key_idx;
-                
-                output_val += attention_weights[weight_idx] * value[v_offset];
-            }
+    // Compute exp and sum
+    T sum = T(0);
+    for (int j = 0; j < seq_len; j++) {
+        if (mask[b * seq_len + j]) {
+            T val = scores[b * num_heads * seq_len * seq_len + h * seq_len * seq_len + i * seq_len + j];
+            val = expf(val - max_val);
+            scores[b * num_heads * seq_len * seq_len + h * seq_len * seq_len + i * seq_len + j] = val;
+            sum += val;
+        } else {
+            scores[b * num_heads * seq_len * seq_len + h * seq_len * seq_len + i * seq_len + j] = T(0);
         }
-        
-        int output_offset = batch_idx * num_heads * seq_len * head_dim + 
-                           head_idx * seq_len * head_dim + 
-                           query_idx * head_dim + key_idx;
-        attention_output[output_offset] = output_val;
+    }
+    
+    // Normalize
+    for (int j = 0; j < seq_len; j++) {
+        if (mask[b * seq_len + j]) {
+            scores[b * num_heads * seq_len * seq_len + h * seq_len * seq_len + i * seq_len + j] /= sum;
+        }
     }
 }
 
-// CUDA kernel for reshaping and combining heads
-__global__ void combine_heads_kernel(
-    const float* multi_head_output,   // [batch_size, num_heads, seq_len, head_dim]
-    const bool* mask,                 // [batch_size, seq_len]
-    float* combined_output,           // [batch_size, seq_len, hidden_dim]
+template<typename T>
+__global__ void masked_attention_output_kernel(
+    const T* attention_weights, // [B, H, N, N]
+    const T* value,             // [B, H, N, D/H]
+    const bool* mask,           // [B, N]
+    T* output,                  // [B, H, N, D/H]
     int batch_size,
     int num_heads,
     int seq_len,
     int head_dim
 ) {
-    int batch_idx = blockIdx.x;
-    int seq_idx = blockIdx.y;
-    int dim_idx = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * num_heads * seq_len * head_dim;
     
-    int hidden_dim = num_heads * head_dim;
+    if (idx >= total_elements) return;
     
-    if (batch_idx >= batch_size || seq_idx >= seq_len || dim_idx >= hidden_dim) {
+    int b = idx / (num_heads * seq_len * head_dim);
+    int h = (idx % (num_heads * seq_len * head_dim)) / (seq_len * head_dim);
+    int i = (idx % (seq_len * head_dim)) / head_dim;
+    int d = idx % head_dim;
+    
+    // Skip masked tokens
+    if (!mask[b * seq_len + i]) {
+        output[idx] = T(0);
         return;
     }
     
-    bool is_masked = !mask[batch_idx * seq_len + seq_idx];
+    // Compute weighted sum
+    T result = T(0);
+    for (int j = 0; j < seq_len; j++) {
+        if (mask[b * seq_len + j]) {
+            T weight = attention_weights[b * num_heads * seq_len * seq_len + h * seq_len * seq_len + i * seq_len + j];
+            T val = value[b * num_heads * seq_len * head_dim + h * seq_len * head_dim + j * head_dim + d];
+            result += weight * val;
+        }
+    }
     
-    if (is_masked) {
-        combined_output[batch_idx * seq_len * hidden_dim + seq_idx * hidden_dim + dim_idx] = 0.0f;
+    output[idx] = result;
+}
+
+template<typename T>
+__global__ void masked_final_projection_kernel(
+    const T* attention_output, // [B, N, D]
+    const T* weight_o,         // [D, D]
+    const T* bias_o,           // [D]
+    const bool* mask,          // [B, N]
+    const T* residual,         // [B, N, D] - original input for residual connection
+    T* output,                 // [B, N, D]
+    int batch_size,
+    int seq_len,
+    int dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * seq_len * dim;
+    
+    if (idx >= total_elements) return;
+    
+    int b = idx / (seq_len * dim);
+    int n = (idx % (seq_len * dim)) / dim;
+    int d = idx % dim;
+    
+    // For masked tokens, preserve original input
+    if (!mask[b * seq_len + n]) {
+        output[idx] = residual[idx];
         return;
     }
     
-    int head_idx = dim_idx / head_dim;
-    int head_dim_idx = dim_idx % head_dim;
+    // Compute final projection
+    T result = bias_o[d];
+    for (int i = 0; i < dim; i++) {
+        T att_val = attention_output[b * seq_len * dim + n * dim + i];
+        result += att_val * weight_o[i * dim + d];
+    }
     
-    int input_idx = batch_idx * num_heads * seq_len * head_dim + 
-                   head_idx * seq_len * head_dim + 
-                   seq_idx * head_dim + head_dim_idx;
-    
-    combined_output[batch_idx * seq_len * hidden_dim + seq_idx * hidden_dim + dim_idx] = 
-        multi_head_output[input_idx];
+    // Add residual connection
+    output[idx] = result + residual[idx];
 }
 
-// Host functions
-torch::Tensor masked_qkv_projection_cuda(
-    torch::Tensor input,
-    torch::Tensor weight_q,
-    torch::Tensor weight_k,
-    torch::Tensor weight_v,
-    torch::Tensor bias_q,
-    torch::Tensor bias_k,
-    torch::Tensor bias_v,
-    torch::Tensor mask
+// Main function implementations
+torch::Tensor masked_multi_head_attention_cuda(
+    torch::Tensor input,           // [B, N, D]
+    torch::Tensor weight_q,        // [D, D]
+    torch::Tensor weight_k,        // [D, D]
+    torch::Tensor weight_v,        // [D, D]
+    torch::Tensor weight_o,        // [D, D]
+    torch::Tensor bias_q,          // [D]
+    torch::Tensor bias_k,          // [D]
+    torch::Tensor bias_v,          // [D]
+    torch::Tensor bias_o,          // [D]
+    torch::Tensor mask,            // [B, N]
+    int num_heads
 ) {
-    auto batch_size = input.size(0);
-    auto seq_len = input.size(1);
-    auto hidden_dim = input.size(2);
+    auto options = input.options();
+    auto device = input.device();
     
-    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(input.device());
-    auto query = torch::zeros({batch_size, seq_len, hidden_dim}, options);
-    auto key = torch::zeros({batch_size, seq_len, hidden_dim}, options);
-    auto value = torch::zeros({batch_size, seq_len, hidden_dim}, options);
+    int batch_size = input.size(0);
+    int seq_len = input.size(1);
+    int dim = input.size(2);
+    int head_dim = dim / num_heads;
     
-    dim3 grid_size(batch_size, seq_len);
-    dim3 block_size(hidden_dim);
+    // Allocate intermediate tensors
+    auto query = torch::zeros({batch_size, seq_len, dim}, options);
+    auto key = torch::zeros({batch_size, seq_len, dim}, options);
+    auto value = torch::zeros({batch_size, seq_len, dim}, options);
+    auto scores = torch::zeros({batch_size, num_heads, seq_len, seq_len}, options);
+    auto attention_output = torch::zeros({batch_size, seq_len, dim}, options);
+    auto output = torch::zeros_like(input);
     
-    masked_qkv_projection_kernel<<<grid_size, block_size>>>(
-        input.data_ptr<float>(),
-        weight_q.data_ptr<float>(),
-        weight_k.data_ptr<float>(),
-        weight_v.data_ptr<float>(),
-        bias_q.data_ptr<float>(),
-        bias_k.data_ptr<float>(),
-        bias_v.data_ptr<float>(),
-        mask.data_ptr<bool>(),
-        query.data_ptr<float>(),
-        key.data_ptr<float>(),
-        value.data_ptr<float>(),
-        batch_size, seq_len, hidden_dim
-    );
+    // Launch kernels
+    const int threads = 256;
+    const int blocks = (batch_size * seq_len * dim + threads - 1) / threads;
     
-    return torch::stack({query, key, value}, 0);
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.type(), "masked_qkv_projection", ([&] {
+        masked_qkv_projection_kernel<scalar_t><<<blocks, threads>>>(
+            input.data_ptr<scalar_t>(),
+            weight_q.data_ptr<scalar_t>(),
+            weight_k.data_ptr<scalar_t>(),
+            weight_v.data_ptr<scalar_t>(),
+            bias_q.data_ptr<scalar_t>(),
+            bias_k.data_ptr<scalar_t>(),
+            bias_v.data_ptr<scalar_t>(),
+            mask.data_ptr<bool>(),
+            query.data_ptr<scalar_t>(),
+            key.data_ptr<scalar_t>(),
+            value.data_ptr<scalar_t>(),
+            batch_size, seq_len, dim
+        );
+    }));
+    
+    // Reshape for multi-head attention
+    query = query.view({batch_size, seq_len, num_heads, head_dim}).transpose(1, 2);
+    key = key.view({batch_size, seq_len, num_heads, head_dim}).transpose(1, 2);
+    value = value.view({batch_size, seq_len, num_heads, head_dim}).transpose(1, 2);
+    
+    // Attention scores
+    dim3 score_blocks(batch_size, num_heads, (seq_len + 15) / 16);
+    dim3 score_threads(16, 16);
+    float scale = 1.0f / sqrt(head_dim);
+    
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.type(), "masked_attention_scores", ([&] {
+        masked_attention_scores_kernel<scalar_t><<<score_blocks, score_threads>>>(
+            query.data_ptr<scalar_t>(),
+            key.data_ptr<scalar_t>(),
+            mask.data_ptr<bool>(),
+            scores.data_ptr<scalar_t>(),
+            batch_size, num_heads, seq_len, head_dim, scale
+        );
+    }));
+    
+    // Softmax
+    dim3 softmax_blocks(batch_size, num_heads, (seq_len + threads - 1) / threads);
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.type(), "masked_softmax", ([&] {
+        masked_softmax_kernel<scalar_t><<<softmax_blocks, threads>>>(
+            scores.data_ptr<scalar_t>(),
+            mask.data_ptr<bool>(),
+            batch_size, num_heads, seq_len
+        );
+    }));
+    
+    // Attention output
+    auto att_out = torch::zeros({batch_size, num_heads, seq_len, head_dim}, options);
+    const int att_blocks = (batch_size * num_heads * seq_len * head_dim + threads - 1) / threads;
+    
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.type(), "masked_attention_output", ([&] {
+        masked_attention_output_kernel<scalar_t><<<att_blocks, threads>>>(
+            scores.data_ptr<scalar_t>(),
+            value.data_ptr<scalar_t>(),
+            mask.data_ptr<bool>(),
+            att_out.data_ptr<scalar_t>(),
+            batch_size, num_heads, seq_len, head_dim
+        );
+    }));
+    
+    // Reshape back
+    att_out = att_out.transpose(1, 2).contiguous().view({batch_size, seq_len, dim});
+    
+    // Final projection
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.type(), "masked_final_projection", ([&] {
+        masked_final_projection_kernel<scalar_t><<<blocks, threads>>>(
+            att_out.data_ptr<scalar_t>(),
+            weight_o.data_ptr<scalar_t>(),
+            bias_o.data_ptr<scalar_t>(),
+            mask.data_ptr<bool>(),
+            input.data_ptr<scalar_t>(),
+            output.data_ptr<scalar_t>(),
+            batch_size, seq_len, dim
+        );
+    }));
+    
+    cudaDeviceSynchronize();
+    return output;
 }
 
-torch::Tensor masked_attention_cuda(
-    torch::Tensor query,
-    torch::Tensor key,
-    torch::Tensor value,
-    torch::Tensor mask
-) {
-    auto batch_size = query.size(0);
-    auto num_heads = query.size(1);
-    auto seq_len = query.size(2);
-    auto head_dim = query.size(3);
-    
-    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(query.device());
-    auto attention_output = torch::zeros_like(query);
-    auto attention_weights = torch::zeros({batch_size, num_heads, seq_len, seq_len}, options);
-    
-    float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-    
-    dim3 grid_size(batch_size, num_heads, seq_len);
-    dim3 block_size(seq_len);
-    
-    masked_attention_kernel<<<grid_size, block_size>>>(
-        query.data_ptr<float>(),
-        key.data_ptr<float>(),
-        value.data_ptr<float>(),
-        mask.data_ptr<bool>(),
-        attention_output.data_ptr<float>(),
-        attention_weights.data_ptr<float>(),
-        batch_size, num_heads, seq_len, head_dim, scale
-    );
-    
-    return attention_output;
-}
-
-torch::Tensor combine_heads_cuda(
-    torch::Tensor multi_head_output,
-    torch::Tensor mask
-) {
-    auto batch_size = multi_head_output.size(0);
-    auto num_heads = multi_head_output.size(1);
-    auto seq_len = multi_head_output.size(2);
-    auto head_dim = multi_head_output.size(3);
-    auto hidden_dim = num_heads * head_dim;
-    
-    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(multi_head_output.device());
-    auto combined_output = torch::zeros({batch_size, seq_len, hidden_dim}, options);
-    
-    dim3 grid_size(batch_size, seq_len);
-    dim3 block_size(hidden_dim);
-    
-    combine_heads_kernel<<<grid_size, block_size>>>(
-        multi_head_output.data_ptr<float>(),
-        mask.data_ptr<bool>(),
-        combined_output.data_ptr<float>(),
-        batch_size, num_heads, seq_len, head_dim
-    );
-    
-    return combined_output;
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("masked_multi_head_attention", &masked_multi_head_attention_cuda, "Masked Multi-Head Attention CUDA");
 }

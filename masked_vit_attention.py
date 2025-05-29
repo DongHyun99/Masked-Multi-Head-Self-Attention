@@ -99,20 +99,24 @@ class MaskedViTAttention(nn.Module):
         attention_mask: torch.Tensor,
         output_attentions: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Forward pass using CUDA kernel"""
+        """Forward pass using optimized CUDA kernel"""
         
-        # Get weight and bias tensors
+        # Ensure contiguous tensors for optimal memory access
+        hidden_states = hidden_states.contiguous()
+        attention_mask = attention_mask.contiguous()
+        
+        # Get weight and bias tensors in the right format
         query_weight = self.query.weight.t().contiguous()  # [hidden_size, hidden_size]
         key_weight = self.key.weight.t().contiguous()
         value_weight = self.value.weight.t().contiguous()
         dense_weight = self.dense.weight.t().contiguous()
         
-        query_bias = self.query.bias
-        key_bias = self.key.bias
-        value_bias = self.value.bias
-        dense_bias = self.dense.bias
+        query_bias = self.query.bias.contiguous()
+        key_bias = self.key.bias.contiguous()
+        value_bias = self.value.bias.contiguous()
+        dense_bias = self.dense.bias.contiguous()
         
-        # Call CUDA kernel
+        # Call optimized CUDA kernel
         attention_output = masked_attention_cuda.masked_multi_head_attention(
             hidden_states,
             query_weight,

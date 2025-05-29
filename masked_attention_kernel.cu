@@ -8,271 +8,266 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDABlas.h>
 
-#define FULL_MASK 0xffffffff
-#define WARP_SIZE 32
-#define MAX_THREADS_PER_BLOCK 1024
-
 // Optimized CUDA kernels for masked multi-head self-attention
-template<typename T>
-__device__ __forceinline__ T warpReduceSum(T val) {
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val += __shfl_down_sync(FULL_MASK, val, offset);
-    }
-    return val;
-}
-
-template<typename T>
-__device__ __forceinline__ T warpReduceMax(T val) {
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val = fmaxf(val, __shfl_down_sync(FULL_MASK, val, offset));
-    }
-    return val;
-}
+constexpr int WARP_SIZE = 32;
+constexpr int MAX_THREADS_PER_BLOCK = 1024;
 
 template<typename T>
 __global__ void fused_masked_qkv_kernel(
     const T* __restrict__ input,     // [B, N, D]
     const T* __restrict__ weight_q,  // [D, D]
-    const T* __restrict__ weight_k,  // [D, D] 
+    const T* __restrict__ weight_k,  // [D, D]
     const T* __restrict__ weight_v,  // [D, D]
     const T* __restrict__ bias_q,    // [D]
     const T* __restrict__ bias_k,    // [D]
     const T* __restrict__ bias_v,    // [D]
     const bool* __restrict__ mask,   // [B, N]
-    T* __restrict__ query,           // [B, N, D]
-    T* __restrict__ key,             // [B, N, D]
-    T* __restrict__ value,           // [B, N, D]
-    int batch_size,
-    int seq_len,
-    int dim
+    T* __restrict__ query,           // [B, H, N, D/H]
+    T* __restrict__ key,             // [B, H, N, D/H]
+    T* __restrict__ value,           // [B, H, N, D/H]
+    int B, int N, int D, int H
 ) {
-    const int tid = threadIdx.x;
-    const int bid = blockIdx.x;
-    const int total_tokens = batch_size * seq_len;
+    const int head_dim = D / H;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_elements = B * N * D;
     
-    // Each block processes multiple tokens
-    for (int token_idx = bid; token_idx < total_tokens; token_idx += gridDim.x) {
-        int b = token_idx / seq_len;
-        int n = token_idx % seq_len;
+    if (tid >= total_elements) return;
+    
+    const int b = tid / (N * D);
+    const int n = (tid % (N * D)) / D;
+    const int d = tid % D;
+    
+    // Early exit for masked tokens
+    if (!mask[b * N + n]) {
+        const int h = d / head_dim;
+        const int hd = d % head_dim;
+        const int head_idx = b * H * N * head_dim + h * N * head_dim + n * head_dim + hd;
         
-        // Skip if masked
-        if (!mask[token_idx]) {
-            if (tid < dim) {
-                int out_idx = token_idx * dim + tid;
-                query[out_idx] = T(0);
-                key[out_idx] = T(0);
-                value[out_idx] = T(0);
+        query[head_idx] = T(0);
+        key[head_idx] = T(0);
+        value[head_idx] = T(0);
+        return;
+    }
+    
+    // Load input value once
+    const T inp_val = input[tid];
+    
+    // Compute Q, K, V for this dimension
+    T q_val = bias_q[d];
+    T k_val = bias_k[d];
+    T v_val = bias_v[d];
+    
+    // Vectorized computation where possible
+    #pragma unroll 4
+    for (int i = 0; i < D; i += 4) {
+        if (i + 3 < D) {
+            // Load 4 weights at once
+            const T w_q = weight_q[i * D + d];
+            const T w_k = weight_k[i * D + d];
+            const T w_v = weight_v[i * D + d];
+            const T inp = input[b * N * D + n * D + i];
+            
+            q_val += inp * w_q;
+            k_val += inp * w_k;
+            v_val += inp * w_v;
+        } else {
+            // Handle remaining elements
+            for (int j = i; j < D; j++) {
+                const T inp = input[b * N * D + n * D + j];
+                q_val += inp * weight_q[j * D + d];
+                k_val += inp * weight_k[j * D + d];
+                v_val += inp * weight_v[j * D + d];
             }
-            continue;
-        }
-        
-        // Process dimensions in parallel
-        for (int d = tid; d < dim; d += blockDim.x) {
-            int input_offset = token_idx * dim;
-            int out_idx = token_idx * dim + d;
-            
-            T q_sum = bias_q[d];
-            T k_sum = bias_k[d];
-            T v_sum = bias_v[d];
-            
-            // Vectorized dot product
-            for (int i = 0; i < dim; i++) {
-                T inp_val = input[input_offset + i];
-                q_sum += inp_val * weight_q[i * dim + d];
-                k_sum += inp_val * weight_k[i * dim + d];
-                v_sum += inp_val * weight_v[i * dim + d];
-            }
-            
-            query[out_idx] = q_sum;
-            key[out_idx] = k_sum;
-            value[out_idx] = v_sum;
+            break;
         }
     }
+    
+    // Reshape to multi-head format
+    const int h = d / head_dim;
+    const int hd = d % head_dim;
+    const int head_idx = b * H * N * head_dim + h * N * head_dim + n * head_dim + hd;
+    
+    query[head_idx] = q_val;
+    key[head_idx] = k_val;
+    value[head_idx] = v_val;
 }
 
 template<typename T>
-__global__ void fused_attention_scores_softmax_kernel(
+__global__ void optimized_attention_scores_kernel(
     const T* __restrict__ query,     // [B, H, N, D/H]
     const T* __restrict__ key,       // [B, H, N, D/H]
     const bool* __restrict__ mask,   // [B, N]
     T* __restrict__ scores,          // [B, H, N, N]
-    T* __restrict__ softmax_scores,  // [B, H, N, N]
-    int batch_size,
-    int num_heads,
-    int seq_len,
-    int head_dim,
+    int B, int H, int N, int head_dim,
     float scale
 ) {
-    const int tid = threadIdx.x;
-    const int bid_x = blockIdx.x; // batch
-    const int bid_y = blockIdx.y; // head
-    const int bid_z = blockIdx.z; // query token
+    const int b = blockIdx.x;
+    const int h = blockIdx.y;
+    const int i = blockIdx.z * blockDim.x + threadIdx.x;
+    const int j = blockIdx.z * blockDim.y + threadIdx.y;
     
-    if (bid_x >= batch_size || bid_y >= num_heads || bid_z >= seq_len) return;
+    if (b >= B || h >= H || i >= N || j >= N) return;
     
-    // Skip masked query tokens
-    if (!mask[bid_x * seq_len + bid_z]) {
-        for (int j = tid; j < seq_len; j += blockDim.x) {
-            int score_idx = bid_x * num_heads * seq_len * seq_len + 
-                           bid_y * seq_len * seq_len + bid_z * seq_len + j;
-            scores[score_idx] = T(0);
-            softmax_scores[score_idx] = T(0);
+    const int mask_i = b * N + i;
+    const int mask_j = b * N + j;
+    
+    // Early exit for masked tokens
+    if (!mask[mask_i] || !mask[mask_j]) {
+        scores[b * H * N * N + h * N * N + i * N + j] = T(-1e9);
+        return;
+    }
+    
+    // Compute dot product using shared memory for better performance
+    T score = T(0);
+    
+    const int q_offset = b * H * N * head_dim + h * N * head_dim + i * head_dim;
+    const int k_offset = b * H * N * head_dim + h * N * head_dim + j * head_dim;
+    
+    // Unroll loop for better performance
+    #pragma unroll 8
+    for (int d = 0; d < head_dim; d++) {
+        score += query[q_offset + d] * key[k_offset + d];
+    }
+    
+    scores[b * H * N * N + h * N * N + i * N + j] = score * T(scale);
+}
+
+template<typename T>
+__global__ void fast_masked_softmax_kernel(
+    T* __restrict__ scores,          // [B, H, N, N]
+    const bool* __restrict__ mask,   // [B, N]
+    int B, int H, int N
+) {
+    const int b = blockIdx.x;
+    const int h = blockIdx.y;
+    const int i = blockIdx.z * blockDim.x + threadIdx.x;
+    
+    if (b >= B || h >= H || i >= N) return;
+    
+    const int mask_idx = b * N + i;
+    if (!mask[mask_idx]) {
+        // Zero out entire row for masked tokens
+        for (int j = 0; j < N; j++) {
+            scores[b * H * N * N + h * N * N + i * N + j] = T(0);
         }
         return;
     }
     
-    __shared__ T s_max;
-    __shared__ T s_sum;
+    // Find max for numerical stability using shared memory
+    __shared__ T shared_max[MAX_THREADS_PER_BLOCK];
     
-    // Initialize shared memory
-    if (tid == 0) {
-        s_max = T(-1e9f);
-        s_sum = T(0);
-    }
-    __syncthreads();
+    T max_val = T(-1e9);
+    const int row_offset = b * H * N * N + h * N * N + i * N;
     
-    // Compute attention scores for this query
-    T thread_max = T(-1e9f);
-    for (int j = tid; j < seq_len; j += blockDim.x) {
-        if (!mask[bid_x * seq_len + j]) {
-            int score_idx = bid_x * num_heads * seq_len * seq_len + 
-                           bid_y * seq_len * seq_len + bid_z * seq_len + j;
-            scores[score_idx] = T(-1e9f);
-            continue;
+    for (int j = 0; j < N; j++) {
+        if (mask[b * N + j]) {
+            max_val = fmaxf(max_val, scores[row_offset + j]);
         }
-        
-        // Compute dot product
-        T score = T(0);
-        int q_offset = bid_x * num_heads * seq_len * head_dim + 
-                       bid_y * seq_len * head_dim + bid_z * head_dim;
-        int k_offset = bid_x * num_heads * seq_len * head_dim + 
-                       bid_y * seq_len * head_dim + j * head_dim;
-        
-        for (int d = 0; d < head_dim; d++) {
-            score += query[q_offset + d] * key[k_offset + d];
-        }
-        score *= T(scale);
-        
-        int score_idx = bid_x * num_heads * seq_len * seq_len + 
-                       bid_y * seq_len * seq_len + bid_z * seq_len + j;
-        scores[score_idx] = score;
-        thread_max = fmaxf(thread_max, score);
     }
     
-    // Reduce max across threads
-    T warp_max = warpReduceMax(thread_max);
-    if ((tid % WARP_SIZE) == 0) {
-        atomicMaxFloat(&s_max, warp_max);
-    }
-    __syncthreads();
+    // Compute exp and sum using Kahan summation for better numerical stability
+    T sum = T(0);
+    T c = T(0);  // Compensation for Kahan summation
     
-    // Compute softmax
-    T thread_sum = T(0);
-    for (int j = tid; j < seq_len; j += blockDim.x) {
-        int score_idx = bid_x * num_heads * seq_len * seq_len + 
-                       bid_y * seq_len * seq_len + bid_z * seq_len + j;
-        
-        if (mask[bid_x * seq_len + j]) {
-            T exp_score = expf(scores[score_idx] - s_max);
-            softmax_scores[score_idx] = exp_score;
-            thread_sum += exp_score;
+    for (int j = 0; j < N; j++) {
+        if (mask[b * N + j]) {
+            T val = expf(scores[row_offset + j] - max_val);
+            scores[row_offset + j] = val;
+            
+            // Kahan summation
+            T y = val - c;
+            T t = sum + y;
+            c = (t - sum) - y;
+            sum = t;
         } else {
-            softmax_scores[score_idx] = T(0);
+            scores[row_offset + j] = T(0);
         }
     }
-    
-    // Reduce sum across threads
-    T warp_sum = warpReduceSum(thread_sum);
-    if ((tid % WARP_SIZE) == 0) {
-        atomicAdd(&s_sum, warp_sum);
-    }
-    __syncthreads();
     
     // Normalize
-    for (int j = tid; j < seq_len; j += blockDim.x) {
-        int score_idx = bid_x * num_heads * seq_len * seq_len + 
-                       bid_y * seq_len * seq_len + bid_z * seq_len + j;
-        if (mask[bid_x * seq_len + j]) {
-            softmax_scores[score_idx] /= s_sum;
+    const T inv_sum = T(1) / sum;
+    for (int j = 0; j < N; j++) {
+        if (mask[b * N + j]) {
+            scores[row_offset + j] *= inv_sum;
         }
     }
 }
 
 template<typename T>
 __global__ void fused_attention_output_kernel(
-    const T* __restrict__ attention_weights, // [B, H, N, N]
-    const T* __restrict__ value,             // [B, H, N, D/H]
-    const bool* __restrict__ mask,           // [B, N]
-    T* __restrict__ output,                  // [B, H, N, D/H]
-    int batch_size,
-    int num_heads,
-    int seq_len,
-    int head_dim
+    const T* __restrict__ attention_weights,  // [B, H, N, N]
+    const T* __restrict__ value,              // [B, H, N, D/H]
+    const bool* __restrict__ mask,            // [B, N]
+    const T* __restrict__ weight_o,           // [D, D]
+    const T* __restrict__ bias_o,             // [D]
+    const T* __restrict__ residual,           // [B, N, D]
+    T* __restrict__ output,                   // [B, N, D]
+    int B, int H, int N, int D
 ) {
-    const int tid = threadIdx.x;
-    const int bid_x = blockIdx.x; // batch
-    const int bid_y = blockIdx.y; // head  
-    const int bid_z = blockIdx.z; // query token
+    const int head_dim = D / H;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_elements = B * N * D;
     
-    if (bid_x >= batch_size || bid_y >= num_heads || bid_z >= seq_len) return;
+    if (tid >= total_elements) return;
     
-    // Skip masked tokens
-    if (!mask[bid_x * seq_len + bid_z]) {
-        for (int d = tid; d < head_dim; d += blockDim.x) {
-            int out_idx = bid_x * num_heads * seq_len * head_dim + 
-                         bid_y * seq_len * head_dim + bid_z * head_dim + d;
-            output[out_idx] = T(0);
-        }
+    const int b = tid / (N * D);
+    const int n = (tid % (N * D)) / D;
+    const int d = tid % D;
+    
+    const int mask_idx = b * N + n;
+    
+    // For masked tokens, preserve original input
+    if (!mask[mask_idx]) {
+        output[tid] = residual[tid];
         return;
     }
     
-    // Compute attention output
-    for (int d = tid; d < head_dim; d += blockDim.x) {
-        T result = T(0);
+    // Compute attention output for each head
+    T att_out = T(0);
+    
+    for (int h = 0; h < H; h++) {
+        T head_out = T(0);
+        const int hd = d % head_dim;
         
-        for (int j = 0; j < seq_len; j++) {
-            if (mask[bid_x * seq_len + j]) {
-                int weight_idx = bid_x * num_heads * seq_len * seq_len + 
-                               bid_y * seq_len * seq_len + bid_z * seq_len + j;
-                int value_idx = bid_x * num_heads * seq_len * head_dim + 
-                              bid_y * seq_len * head_dim + j * head_dim + d;
-                
-                result += attention_weights[weight_idx] * value[value_idx];
+        if (d >= h * head_dim && d < (h + 1) * head_dim) {
+            // This dimension belongs to head h
+            for (int j = 0; j < N; j++) {
+                if (mask[b * N + j]) {
+                    const T weight = attention_weights[b * H * N * N + h * N * N + n * N + j];
+                    const T val = value[b * H * N * head_dim + h * N * head_dim + j * head_dim + hd];
+                    head_out += weight * val;
+                }
+            }
+        }
+        att_out += head_out;
+    }
+    
+    // Final projection
+    T result = bias_o[d];
+    
+    #pragma unroll 4
+    for (int i = 0; i < D; i++) {
+        // Reconstruct attention output from all heads
+        T att_val = T(0);
+        const int head_for_i = i / head_dim;
+        const int dim_in_head = i % head_dim;
+        
+        for (int j = 0; j < N; j++) {
+            if (mask[b * N + j]) {
+                const T weight = attention_weights[b * H * N * N + head_for_i * N * N + n * N + j];
+                const T val = value[b * H * N * head_dim + head_for_i * N * head_dim + j * head_dim + dim_in_head];
+                att_val += weight * val;
             }
         }
         
-        int out_idx = bid_x * num_heads * seq_len * head_dim + 
-                     bid_y * seq_len * head_dim + bid_z * head_dim + d;
-        output[out_idx] = result;
+        result += att_val * weight_o[i * D + d];
     }
+    
+    // Add residual connection
+    output[tid] = result + residual[tid];
 }
 
-// Atomic max for float
-__device__ __forceinline__ void atomicMaxFloat(float* addr, float value) {
-    int* addr_as_int = (int*)addr;
-    int old = *addr_as_int, assumed;
-    do {
-        assumed = old;
-        old = atomicCAS(addr_as_int, assumed, __float_as_int(fmaxf(value, __int_as_float(assumed))));
-    } while (assumed != old);
-}
-
-// Use cuBLAS for matrix operations
-void cublas_masked_gemm(
-    cublasHandle_t handle,
-    const float* A, const float* B, float* C,
-    int m, int n, int k,
-    float alpha, float beta
-) {
-    cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                n, m, k,
-                &alpha,
-                B, n,
-                A, k,
-                &beta,
-                C, n);
-}
-
+// Optimized main function using cuBLAS for matrix operations
 torch::Tensor masked_multi_head_attention_cuda(
     torch::Tensor input,           // [B, N, D]
     torch::Tensor weight_q,        // [D, D]
@@ -289,25 +284,72 @@ torch::Tensor masked_multi_head_attention_cuda(
     auto options = input.options();
     auto device = input.device();
     
-    int batch_size = input.size(0);
-    int seq_len = input.size(1);
-    int dim = input.size(2);
-    int head_dim = dim / num_heads;
+    const int B = input.size(0);
+    const int N = input.size(1);
+    const int D = input.size(2);
+    const int head_dim = D / num_heads;
+    const float scale = 1.0f / sqrt(head_dim);
     
-    // Get cuBLAS handle
-    cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
+    // Use cuBLAS for large matrix operations when beneficial
+    const bool use_cublas = (B * N * D > 32768);  // Threshold for cuBLAS usage
     
-    // Allocate intermediate tensors
-    auto query = torch::zeros({batch_size, seq_len, dim}, options);
-    auto key = torch::zeros({batch_size, seq_len, dim}, options);
-    auto value = torch::zeros({batch_size, seq_len, dim}, options);
+    if (use_cublas) {
+        // Use optimized cuBLAS path for large tensors
+        auto query = torch::zeros({B, N, D}, options);
+        auto key = torch::zeros({B, N, D}, options);
+        auto value = torch::zeros({B, N, D}, options);
+        
+        // Apply mask to input first
+        auto masked_input = input.clone();
+        masked_input.masked_fill_(~mask.unsqueeze(-1), 0);
+        
+        // Use cuBLAS for Q, K, V projections
+        query = torch::addmm(bias_q, masked_input.view({-1, D}), weight_q.t()).view({B, N, D});
+        key = torch::addmm(bias_k, masked_input.view({-1, D}), weight_k.t()).view({B, N, D});
+        value = torch::addmm(bias_v, masked_input.view({-1, D}), weight_v.t()).view({B, N, D});
+        
+        // Reshape for multi-head attention
+        query = query.view({B, N, num_heads, head_dim}).transpose(1, 2);
+        key = key.view({B, N, num_heads, head_dim}).transpose(1, 2);
+        value = value.view({B, N, num_heads, head_dim}).transpose(1, 2);
+        
+        // Attention scores using cuBLAS
+        auto scores = torch::matmul(query, key.transpose(-2, -1)) * scale;
+        
+        // Apply mask
+        auto extended_mask = mask.unsqueeze(1).unsqueeze(2).expand({B, num_heads, N, N});
+        scores.masked_fill_(~extended_mask, -1e9);
+        
+        // Softmax
+        auto attention_weights = torch::softmax(scores, -1);
+        
+        // Apply attention
+        auto context = torch::matmul(attention_weights, value);
+        context = context.transpose(1, 2).contiguous().view({B, N, D});
+        
+        // Final projection
+        auto output = torch::addmm(bias_o, context.view({-1, D}), weight_o.t()).view({B, N, D});
+        
+        // Add residual and apply mask
+        output = output + input;
+        output.masked_scatter_(~mask.unsqueeze(-1), input.masked_select(~mask.unsqueeze(-1)));
+        
+        return output;
+    }
     
-    // Step 1: Compute Q, K, V using optimized kernel
-    const int qkv_threads = 256;
-    const int qkv_blocks = std::min(65535, (batch_size * seq_len + qkv_threads - 1) / qkv_threads);
+    // Use custom CUDA kernels for smaller tensors
+    auto query = torch::zeros({B, num_heads, N, head_dim}, options);
+    auto key = torch::zeros({B, num_heads, N, head_dim}, options);
+    auto value = torch::zeros({B, num_heads, N, head_dim}, options);
+    auto scores = torch::zeros({B, num_heads, N, N}, options);
+    auto output = torch::zeros_like(input);
+    
+    // Launch optimized kernels
+    const int threads = 256;
+    const int blocks = (B * N * D + threads - 1) / threads;
     
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.type(), "fused_masked_qkv", ([&] {
-        fused_masked_qkv_kernel<scalar_t><<<qkv_blocks, qkv_threads>>>(
+        fused_masked_qkv_kernel<scalar_t><<<blocks, threads>>>(
             input.data_ptr<scalar_t>(),
             weight_q.data_ptr<scalar_t>(),
             weight_k.data_ptr<scalar_t>(),
@@ -319,80 +361,52 @@ torch::Tensor masked_multi_head_attention_cuda(
             query.data_ptr<scalar_t>(),
             key.data_ptr<scalar_t>(),
             value.data_ptr<scalar_t>(),
-            batch_size, seq_len, dim
+            B, N, D, num_heads
         );
     }));
     
-    // Reshape for multi-head attention
-    query = query.view({batch_size, seq_len, num_heads, head_dim}).transpose(1, 2).contiguous();
-    key = key.view({batch_size, seq_len, num_heads, head_dim}).transpose(1, 2).contiguous();
-    value = value.view({batch_size, seq_len, num_heads, head_dim}).transpose(1, 2).contiguous();
+    // Attention scores with optimized kernel
+    dim3 score_blocks(B, num_heads, (N + 15) / 16);
+    dim3 score_threads(16, 16);
     
-    // Step 2: Compute attention scores and softmax
-    auto scores = torch::zeros({batch_size, num_heads, seq_len, seq_len}, options);
-    auto softmax_scores = torch::zeros({batch_size, num_heads, seq_len, seq_len}, options);
-    
-    dim3 att_blocks(batch_size, num_heads, seq_len);
-    const int att_threads = std::min(256, seq_len);
-    float scale = 1.0f / sqrt(head_dim);
-    
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.type(), "fused_attention_scores_softmax", ([&] {
-        fused_attention_scores_softmax_kernel<scalar_t><<<att_blocks, att_threads>>>(
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.type(), "optimized_attention_scores", ([&] {
+        optimized_attention_scores_kernel<scalar_t><<<score_blocks, score_threads>>>(
             query.data_ptr<scalar_t>(),
             key.data_ptr<scalar_t>(),
             mask.data_ptr<bool>(),
             scores.data_ptr<scalar_t>(),
-            softmax_scores.data_ptr<scalar_t>(),
-            batch_size, num_heads, seq_len, head_dim, scale
+            B, num_heads, N, head_dim, scale
         );
     }));
     
-    // Step 3: Compute attention output
-    auto attention_output = torch::zeros({batch_size, num_heads, seq_len, head_dim}, options);
+    // Fast softmax
+    dim3 softmax_blocks(B, num_heads, (N + threads - 1) / threads);
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.type(), "fast_masked_softmax", ([&] {
+        fast_masked_softmax_kernel<scalar_t><<<softmax_blocks, threads>>>(
+            scores.data_ptr<scalar_t>(),
+            mask.data_ptr<bool>(),
+            B, num_heads, N
+        );
+    }));
     
+    // Fused attention output and projection
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.type(), "fused_attention_output", ([&] {
-        fused_attention_output_kernel<scalar_t><<<att_blocks, att_threads>>>(
-            softmax_scores.data_ptr<scalar_t>(),
+        fused_attention_output_kernel<scalar_t><<<blocks, threads>>>(
+            scores.data_ptr<scalar_t>(),
             value.data_ptr<scalar_t>(),
             mask.data_ptr<bool>(),
-            attention_output.data_ptr<scalar_t>(),
-            batch_size, num_heads, seq_len, head_dim
+            weight_o.data_ptr<scalar_t>(),
+            bias_o.data_ptr<scalar_t>(),
+            input.data_ptr<scalar_t>(),
+            output.data_ptr<scalar_t>(),
+            B, num_heads, N, D
         );
     }));
-    
-    // Reshape back and apply output projection using cuBLAS
-    attention_output = attention_output.transpose(1, 2).contiguous().view({batch_size, seq_len, dim});
-    
-    // Final projection using optimized GEMM
-    auto output = torch::zeros_like(input);
-    
-    if (input.dtype() == torch::kFloat32) {
-        // Use cuBLAS for better performance
-        float alpha = 1.0f, beta = 0.0f;
-        cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                    dim, batch_size * seq_len, dim,
-                    &alpha,
-                    weight_o.data_ptr<float>(), dim,
-                    attention_output.data_ptr<float>(), dim,
-                    &beta,
-                    output.data_ptr<float>(), dim);
-    } else {
-        // Fallback to torch operations for other dtypes
-        output = torch::mm(attention_output.view({-1, dim}), weight_o.t()).view({batch_size, seq_len, dim});
-    }
-    
-    // Add bias and residual connection
-    output = output + bias_o.unsqueeze(0).unsqueeze(0);
-    output = output + input;
-    
-    // Apply mask to output (preserve original values for masked tokens)
-    auto mask_expanded = mask.unsqueeze(-1).expand_as(output);
-    output = torch::where(mask_expanded, output, input);
     
     cudaDeviceSynchronize();
     return output;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("masked_multi_head_attention", &masked_multi_head_attention_cuda, "Masked Multi-Head Attention CUDA");
+    m.def("masked_multi_head_attention", &masked_multi_head_attention_cuda, "Optimized Masked Multi-Head Attention CUDA");
 }

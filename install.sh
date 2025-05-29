@@ -45,13 +45,13 @@ check_cuda() {
     
     if command -v nvcc &> /dev/null; then
         CUDA_VERSION=$(nvcc --version | grep "release" | sed 's/.*release //' | sed 's/,.*//')
-        CUDA_MAJOR=$(echo $CUDA_VERSION | cut -d. -f1)
-        CUDA_MINOR=$(echo $CUDA_VERSION | cut -d. -f2)
+        CUDA_MAJOR=$(echo "$CUDA_VERSION" | cut -d. -f1)
+        CUDA_MINOR=$(echo "$CUDA_VERSION" | cut -d. -f2)
         
         print_success "CUDA ${CUDA_VERSION} found"
         
         # Check if CUDA version is sufficient (>= 11.0)
-        if (( CUDA_MAJOR >= 11 )); then
+        if [ "$CUDA_MAJOR" -ge 11 ] 2>/dev/null; then
             print_success "CUDA version is supported"
         else
             print_warning "CUDA version ${CUDA_VERSION} may cause issues (recommend >= 11.0)"
@@ -97,16 +97,18 @@ check_python() {
     
     # Check Python version
     PYTHON_VERSION=$(python3 --version 2>&1 | sed 's/Python //')
-    PYTHON_MAJOR=$(echo $PYTHON_VERSION | cut -d. -f1)
-    PYTHON_MINOR=$(echo $PYTHON_VERSION | cut -d. -f2)
+    PYTHON_MAJOR=$(echo "$PYTHON_VERSION" | cut -d. -f1)
+    PYTHON_MINOR=$(echo "$PYTHON_VERSION" | cut -d. -f2)
     
     print_success "Python ${PYTHON_VERSION} found"
     
-    # Check if Python version is sufficient
-    if (( PYTHON_MAJOR >= 3 && PYTHON_MINOR >= 8 )); then
+    # Check if Python version is sufficient (>= 3.8)
+    if [ "$PYTHON_MAJOR" -eq 3 ] && [ "$PYTHON_MINOR" -ge 8 ] 2>/dev/null; then
+        print_success "Python version is supported"
+    elif [ "$PYTHON_MAJOR" -gt 3 ] 2>/dev/null; then
         print_success "Python version is supported"
     else
-        print_error "Python version must be >= 3.8"
+        print_error "Python version must be >= 3.8 (found ${PYTHON_VERSION})"
         exit 1
     fi
     
@@ -116,8 +118,8 @@ check_python() {
         print_success "PyTorch ${TORCH_VERSION} found"
         
         # Check PyTorch version
-        TORCH_MAJOR=$(echo $TORCH_VERSION | cut -d. -f1)
-        if (( TORCH_MAJOR >= 2 )); then
+        TORCH_MAJOR=$(echo "$TORCH_VERSION" | cut -d. -f1)
+        if [ "$TORCH_MAJOR" -ge 2 ] 2>/dev/null; then
             print_success "PyTorch version is supported"
         else
             print_warning "PyTorch version ${TORCH_VERSION} may cause issues (recommend >= 2.0)"
@@ -155,23 +157,29 @@ check_gpu() {
         print_success "Found $GPU_COUNT GPU(s):"
         
         # Check each GPU
-        nvidia-smi --query-gpu=index,name,compute_cap,memory.total --format=csv,noheader,nounits | while IFS=, read -r index name compute_cap memory; do
+        while IFS=, read -r index name compute_cap memory; do
+            # Remove leading/trailing whitespace
+            index=$(echo "$index" | xargs)
+            name=$(echo "$name" | xargs)
+            compute_cap=$(echo "$compute_cap" | xargs)
+            memory=$(echo "$memory" | xargs)
+            
             print_success "  GPU $index: $name"
             print_success "    Compute Capability: $compute_cap"
             print_success "    Memory: ${memory} MB"
             
             # Check if compute capability is sufficient
-            COMPUTE_MAJOR=$(echo $compute_cap | cut -d. -f1)
-            COMPUTE_MINOR=$(echo $compute_cap | cut -d. -f2)
+            COMPUTE_MAJOR=$(echo "$compute_cap" | cut -d. -f1)
+            COMPUTE_MINOR=$(echo "$compute_cap" | cut -d. -f2)
             
-            if (( COMPUTE_MAJOR >= 7 )); then
+            if [ "$COMPUTE_MAJOR" -ge 7 ] 2>/dev/null; then
                 print_success "    ✅ Compute capability is excellent for optimization"
-            elif (( COMPUTE_MAJOR >= 6 )); then
+            elif [ "$COMPUTE_MAJOR" -ge 6 ] 2>/dev/null; then
                 print_warning "    ⚠️  Compute capability is supported but may not be optimal"
             else
                 print_warning "    ❌ Compute capability is too low for optimal performance"
             fi
-        done
+        done < <(nvidia-smi --query-gpu=index,name,compute_cap,memory.total --format=csv,noheader,nounits)
         
         # Get current GPU for compilation optimization
         CURRENT_GPU_CAP=$(python3 -c "import torch; print(''.join(map(str, torch.cuda.get_device_capability())))" 2>/dev/null || echo "75")
